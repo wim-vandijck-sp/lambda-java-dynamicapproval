@@ -4,7 +4,7 @@
   <groupId>ETS-examples</groupId>
   <artifactId>lambda-java-dynamicapproval</artifactId>
   <name>lambda-java-dynamicapproval</name>
-  <version>1.0.0</version>
+  <version>1.0.0_mks-poc</version>
   <build>
     <plugins>
       <plugin>

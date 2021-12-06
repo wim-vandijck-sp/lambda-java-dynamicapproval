@@ -8,8 +8,15 @@ import com.amazonaws.services.lambda.runtime.events.APIGatewayV2WebSocketRespons
 import com.amazonaws.services.s3.AmazonS3;
 import com.amazonaws.services.s3.AmazonS3ClientBuilder;
 import com.amazonaws.services.s3.model.S3Object;
-import com.amazonaws.services.lambda.runtime.LambdaLogger;
-
+import com.amazonaws.services.secretsmanager.AWSSecretsManager;
+import com.amazonaws.services.secretsmanager.AWSSecretsManagerClientBuilder;
+import com.amazonaws.services.secretsmanager.model.DecryptionFailureException;
+import com.amazonaws.services.secretsmanager.model.GetSecretValueRequest;
+import com.amazonaws.services.secretsmanager.model.GetSecretValueResult;
+import com.amazonaws.services.secretsmanager.model.InternalServiceErrorException;
+import com.amazonaws.services.secretsmanager.model.InvalidParameterException;
+import com.amazonaws.services.secretsmanager.model.InvalidRequestException;
+import com.amazonaws.services.secretsmanager.model.ResourceNotFoundException;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 
@@ -18,8 +25,11 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.UnsupportedEncodingException;
+import java.net.MalformedURLException;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -39,47 +49,60 @@ import org.json.simple.JSONObject;
 import org.json.simple.parser.JSONParser;
 import org.json.simple.parser.ParseException;
 
-public class DynamicApproval implements RequestHandler<APIGatewayV2WebSocketEvent, APIGatewayV2WebSocketResponse> {
-  LambdaLogger       logger;
+import retrofit2.Response;
+import sailpoint.identitynow.api.IdentityNowService;
+import sailpoint.identitynow.api.object.Identity;
+import sailpoint.identitynow.api.object.QueryObject;
+import sailpoint.identitynow.api.object.SearchQuery;
 
-  Gson gson = new GsonBuilder().setPrettyPrinting().create();
-    
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+public class DynamicApproval implements RequestHandler<APIGatewayV2WebSocketEvent, APIGatewayV2WebSocketResponse> {
+
+  final static Logger log = LogManager.getLogger(DynamicApproval.class);
+  IdentityNowService idnService;
+  Map<String,Object> attrs = new HashMap<String,Object>();
+
+  Gson gson     = new GsonBuilder().setPrettyPrinting().create();
+  String tenant = null;
+  Boolean useDepartment = false;
+
   public APIGatewayV2WebSocketResponse handleRequest(APIGatewayV2WebSocketEvent event, Context context)
   {
-    logger = context.getLogger();
+    log.trace("Entering handleRequest");
+
     try {
       Util.logEnvironment(event, context, gson);
     } catch (IOException e2) {
-      logger.log(e2.getMessage());
+      log.error(e2.getMessage());
       e2.printStackTrace();
     } catch (XmlPullParserException e2) {
-      logger.log(e2.getMessage());
+      log.error(e2.getMessage());
       e2.printStackTrace();
     }
 
     
     APIGatewayV2WebSocketResponse response = new APIGatewayV2WebSocketResponse();
     AmazonS3 client     = null;
-    String tenant       = null;
     
     Map<String,String> stageVars = event.getStageVariables();
-    logger.log("stage variables: " + stageVars);
+    log.debug("stage variables: " + stageVars);
 //		String clientId     = stageVars.get("clientId");
 //		String clientSecret = stageVars.get("clientSecret");
     String bucket       = stageVars.get("bucket");
     
     try {
-      HashMap<String,List<String>> matrix = getDynamicApprovalCSV(client,bucket);
 
       String body = "{}";
       try {
         String requestString = event.getBody();
-        logger.log("event: " + event.toString());
-        logger.log("body:  " + requestString);
+        log.debug("event: " + event.toString());
+        log.debug("body:  " + requestString);
         
         JSONParser parser     = new JSONParser();
         JSONObject jo         = (JSONObject) parser.parse(requestString);
-        logger.log("requestJsonObject: " + jo);
+        log.debug("requestJsonObject: " + jo);
 
         if (null != jo) {
           // JSONObject invocation = (JSONObject) jo.get("startInvocationInput");
@@ -99,58 +122,86 @@ public class DynamicApproval implements RequestHandler<APIGatewayV2WebSocketEven
             JSONObject requestedBy    = (JSONObject) detail.get("requestedBy");
             JSONArray  requestedItems = (JSONArray)  detail.get("requestedItems");
       
-            // logger.log("metadata: " + metadata + "\n\n");
-            logger.log("requestedFor:   " + requestedFor + "\n\n");
-            logger.log("requestedBy:    " + requestedBy + "\n\n");
-            logger.log("requestedItems: " + requestedItems + "\n\n");
+            // log.debug("metadata: " + metadata + "\n\n");
+            log.debug("requestedFor:   " + requestedFor + "\n\n");
+            log.debug("requestedBy:    " + requestedBy + "\n\n");
+            log.debug("requestedItems: " + requestedItems + "\n\n");
       
             String secret       = metadata.get("secret").toString();
             String url          = metadata.get("callbackURL").toString();
             String requestee    = requestedFor.get("name").toString();
+            String requesteeId  = requestedFor.get("id").toString();
             String requester    = requestedBy.get("name").toString();
             String item         = ((JSONObject)requestedItems.get(0)).get("name").toString();
             
-            logger.log("requestee: " + requestee + "\n");
-            logger.log("requester: " + requester + "\n");
-            logger.log("item     : " + item + "\n");
+            log.debug("requestee: " + requestee + "\n");
+            log.debug("requester: " + requester + "\n");
+            log.debug("item     : " + item + "\n");
             
+            // Create IDN session
+            createSession(url);
+
+            // Fetch identity attributes
+            try {
+              attrs  = getAttributes(idnService, requesteeId);
+            } catch (Exception e) {
+              log.error("Error checking identity attributes: " + e.getLocalizedMessage());
+            }
+
+            String department = (String) attrs.get("department");
+            if (null != department && !"".equals(department))
+              useDepartment = true;
+
+            String approver = "";
+            String approverId = "";
+            String file   = "dynamicApproval.csv";
+
+            if (useDepartment) {
+              file = "dynamicDepartmentApproval.csv";
+              item = department;
+            }
+
+            HashMap<String,List<String>> matrix = getDynamicApprovalCSV(client,bucket,file);
+
             if (matrix.get(item) != null) {
+              approver   = matrix.get(item).get(0);
+              approverId = matrix.get(item).get(1);
               // WHEN sent directly to the API GATEWAY
               // body = "{\n"
               //     + "  \"name\": \"" + matrix.get(item).get(0) + "\",\n"
               //     + "  \"id\": \""   + matrix.get(item).get(1) + "\",\n"
               //     + "  \"type\": \"IDENTITY\"\n"
               //     + "}\n";
-              
+            }  else {
+              log.debug("Didn't find an entry for " + item + " in the matrix: " + matrix);
+            }
                     
-              // When sent through the EVENT BUS:
-              body = "{\n"
-                  + "    \"secret\": \"" + secret + "\",\n"
-                  + "    \"output\": {\n"
-                  + "  \"name\": \"" + matrix.get(item).get(0) + "\",\n"
-                  + "  \"id\": \"" + matrix.get(item).get(1) + "\",\n"
-                  + "      \"type\": \"IDENTITY\"\n"
-                  + "    }\n"
-                  + "}\"\n";
-              }  else {
-                  logger.log("Didn't find an entry in the matrix: " + matrix);
-              }
+            // When sent through the EVENT BUS:
+            body = "{\n"
+                + "    \"secret\": \"" + secret + "\",\n"
+                + "    \"output\": {\n"
+                + "  \"name\": \"" + approver + "\",\n"
+                + "  \"id\": \"" + approverId + "\",\n"
+                + "      \"type\": \"IDENTITY\"\n"
+                + "    }\n"
+                + "}\"\n";
+
             response.setBody(body);
-            logger.log(response + "\n");
+            log.debug(response + "\n");
             sendCallBack(body,url);
 
             } else {
-              logger.log("ERROR: Couldn't get details from jsonObject");
+              log.debug("ERROR: Couldn't get details from jsonObject");
             }
         } else {
-          logger.log("ERROR: Couldn't parse jsonObject");
+          log.debug("ERROR: Couldn't parse jsonObject");
         }
         
   //	    if (null != callbackURL) {
   //	    	sendCallBack(logger,body,callbackURL);
   //	    }
         
-        logger.log("Done.\n\n");
+        log.debug("Done.\n\n");
       } catch (ParseException e) {
         e.printStackTrace();
       }
@@ -158,14 +209,175 @@ public class DynamicApproval implements RequestHandler<APIGatewayV2WebSocketEven
       // TODO Auto-generated catch block
       e1.printStackTrace();
     }
+
+    log.trace("Leaving handleRequest");
     return response;
   }
   
-  private HashMap<String, List<String>> getDynamicApprovalCSV(AmazonS3 client, String bucket) throws IOException {
-    logger.log("Entering getDynamicApprovalCSV");
-    
-    String file   = "dynamicApproval.csv";
+  /**
+   * Creates the IDN session based on the URL
+   * Needs to retrieve the PAT from the Secrets manager
+   * @param url
+   * @throws MalformedURLException
+   * @throws ParseException
+   */
+  private void createSession(String url) throws MalformedURLException, ParseException {
 
+    log.trace("Entering createSession");
+
+    // https://enterprise802.api.identitynow.com/beta/trigger-invocations/57d4ba02-e2a1-423b-943f-d8d1c6ae860a/complete
+    URL uurl = new URL(url);
+    tenant    = uurl.getHost();
+    String tenantUrl = "https://" + tenant;
+    log.debug("tenant: " + tenantUrl);
+    String[] splitHost   = tenant.split("\\.");
+    String    tenantName = splitHost[0];
+
+    // Fetch credentials for IDN
+    JSONObject idnSecrets = getPAT(tenantName);
+    String clientId     = idnSecrets.get("clientId").toString();
+    String clientSecret = idnSecrets.get("clientSecret").toString();
+    // log.debug("clientId:     " + clientId);
+    // log.debug("clientSecret: " + clientSecret);
+    
+    log.debug("Getting idnService");
+    idnService = new IdentityNowService( tenantUrl, clientId, clientSecret, null, 60000L );
+    log.debug("Got idnService");
+    
+    log.debug( "Checking credentials..." );
+    try {
+      idnService.createSession();
+      log.info("Session created.");
+    } catch ( Exception e ) {
+      log.error( "Error Logging into IdentityNow.  Check your credentials and try again. [" + e.getLocalizedMessage() +  "]" );
+      e.printStackTrace();
+      System.exit(0);
+    }
+
+    log.trace("Leaving createSession");
+  }
+
+/**
+   * Gets the authentication info for the IDN tenant
+   * @param String tenant
+   * @return JSONObject : Map with the clientId and clientSecret
+   * @throws ParseException
+   */
+  private JSONObject getPAT(String tenant) throws ParseException {
+    log.trace("Entering getPAT: " + tenant);
+
+    JSONObject secrets = null;
+    String secretName = tenant + "-token";
+    String region     = "us-west-1";
+
+    // Create a Secrets Manager client
+    AWSSecretsManager client  = AWSSecretsManagerClientBuilder.standard()
+                                    .withRegion(region)
+                                    .build();
+    
+    // In this sample we only handle the specific exceptions for the 'GetSecretValue' API.
+    // See https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_GetSecretValue.html
+    // We rethrow the exception by default.
+    
+    String secret              = null;
+    String decodedBinarySecret = null;
+    GetSecretValueRequest getSecretValueRequest = new GetSecretValueRequest()
+                    .withSecretId(secretName);
+    GetSecretValueResult getSecretValueResult = null;
+
+    try {
+        getSecretValueResult = client.getSecretValue(getSecretValueRequest);
+    } catch (DecryptionFailureException e) {
+        // Secrets Manager can't decrypt the protected secret text using the provided KMS key.
+        // Deal with the exception here, and/or rethrow at your discretion.
+        throw e;
+    } catch (InternalServiceErrorException e) {
+        // An error occurred on the server side.
+        // Deal with the exception here, and/or rethrow at your discretion.
+        throw e;
+    } catch (InvalidParameterException e) {
+        // You provided an invalid value for a parameter.
+        // Deal with the exception here, and/or rethrow at your discretion.
+        throw e;
+    } catch (InvalidRequestException e) {
+        // You provided a parameter value that is not valid for the current state of the resource.
+        // Deal with the exception here, and/or rethrow at your discretion.
+        throw e;
+    } catch (ResourceNotFoundException e) {
+        // We can't find the resource that you asked for.
+        // Deal with the exception here, and/or rethrow at your discretion.
+        throw e;
+    }
+
+    // Decrypts secret using the associated KMS CMK.
+    // Depending on whether the secret is a string or binary, one of these fields will be populated.
+    if (getSecretValueResult.getSecretString() != null) {
+      secret = getSecretValueResult.getSecretString();
+    } else {
+      decodedBinarySecret = new String(Base64.getDecoder().decode(getSecretValueResult.getSecretBinary()).array());
+    }
+
+    log.debug("secret: " + secret);
+    log.debug("decoded: " + decodedBinarySecret);
+
+    JSONParser parser = new JSONParser();
+    secrets = (JSONObject) parser.parse(secret);
+    log.trace("Leaving getPAT");
+    return secrets;
+  }
+
+  /**
+   * Check for toxic attribute on the identity in IDN
+   * Currently hardcoded to search for `ccom` attribute
+   * This relies on the IdentityNowService from Neil McGlennon
+   * @param idnService2
+   * @param requesteeId
+   * @return boolean : allowed or not
+   * @throws IOException
+   * @throws Exception
+   */
+  private Map<String,Object> getAttributes(IdentityNowService idnService2, String requesteeId) throws IOException, Exception {
+    log.trace("Entering getAttributes: " + requesteeId);
+    
+    Map<String,Object> attributes = new HashMap<String,Object>();
+    String searchQueryString = "id:" + requesteeId;
+    log.debug("search query string: " + searchQueryString);
+    SearchQuery searchQuery = new SearchQuery(searchQueryString);
+    log.debug("using searchQuery: " + searchQuery);
+    QueryObject query = new QueryObject(searchQuery);
+    
+    log.debug("Executing search");
+    Response<List<Identity>> response = idnService.getSearchService().getIdentities(false, 0, 10, query).execute();
+    log.debug("Got response: " + response);
+
+    if (response.isSuccessful()) {
+      log.debug("body: " + response.body());
+      log.debug("response: " + response.toString());
+      List<Identity> ids = response.body();
+      log.debug("Found " + ids.size() + " identities");
+    
+      int counter = 0;
+      for (Identity identity : ids) {
+        log.debug(identity.toString());
+        counter++;
+        log.debug(counter + " : id           : " + identity.getId());
+        log.debug(counter + " : name         : " + identity.getSource().getName());
+        log.debug(counter + " : displayName  : " + identity.getDisplayName());
+        log.debug(counter + " : attributes   : " + identity.getAttributes());
+        log.debug("===============");
+        attributes = identity.getAttributes();
+        
+      }
+    } else {
+      log.debug("Response was not successful for identity search.");
+    }
+    log.trace("Leaving checkAttributes: " + attributes);
+    return attributes;
+  }
+
+  private HashMap<String, List<String>> getDynamicApprovalCSV(AmazonS3 client, String bucket, String file) throws IOException {
+    log.trace("Entering getDynamicApprovalCSV");
+  
     if (null == client) {
       client = getS3Client();
     }
@@ -174,7 +386,7 @@ public class DynamicApproval implements RequestHandler<APIGatewayV2WebSocketEven
     String[] data = null;
     
     S3Object       s3Object = client.getObject(bucket, file);
-    logger.log("Got s3 file.");
+    log.debug("Got s3 file.");
     InputStream    is       = null;
     BufferedReader br       = null;
     try {
@@ -201,66 +413,19 @@ public class DynamicApproval implements RequestHandler<APIGatewayV2WebSocketEven
       }
     }
     
-    logger.log("Leaving getDynamicApprovalCSV: " + map);
+    log.trace("Leaving getDynamicApprovalCSV: " + map);
     return map;
   }
 
-//	public void sendCallBack(String body, String urlString) {
-//		logger.log("Entering sendCallBack");
-//		
-//		URL url = null;
-//		try {
-//			url = new URL(urlString);
-//		} catch (MalformedURLException e1) {
-//			// TODO Auto-generated catch block
-//			e1.printStackTrace();
-//		}
-//		URLConnection con;
-//		try {
-//			con = url.openConnection();
-//
-//			HttpURLConnection http = (HttpURLConnection)con;
-//			http.setRequestMethod("POST"); // PUT is another valid option
-//			http.setDoOutput(true);
-//			
-//			byte[] out = body.getBytes(StandardCharsets.UTF_8);
-//			int length = out.length;
-//
-//			http.setFixedLengthStreamingMode(length);
-//			http.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
-//			http.connect();
-//			logger.log("Sending response");
-//			try(OutputStream os = http.getOutputStream()) {
-//			    os.write(out);
-//			    logger.log("Response code: " + http.getResponseCode());
-//					// Read response
-//					try(BufferedReader br = new BufferedReader(
-//						  new InputStreamReader(http.getInputStream(), "utf-8"))) {
-//						    StringBuilder response = new StringBuilder();
-//						    String responseLine = null;
-//						    while ((responseLine = br.readLine()) != null) {
-//						        response.append(responseLine.trim());
-//						    }
-//						    
-//						    logger.log("Answer: "+ response.toString());
-//					}
-//			}
-//		} catch (IOException e) {
-//			// TODO Auto-generated catch block
-//			e.printStackTrace();
-//		}
-//		logger.log("Leaving sendCallBack");
-//	}
-  
   public void sendCallBack(String body, String urlString) throws org.apache.http.ParseException, IOException {
-    logger.log("Entering sendCallBack");
+    log.trace("Entering sendCallBack");
     
-    logger.log("- body: " + body);
-    logger.log("- url: " + urlString);
+    log.debug("- body: " + body);
+    log.debug("- url: " + urlString);
 
     StringEntity entity = new StringEntity(body, ContentType.APPLICATION_JSON);
     String entityString = EntityUtils.toString(entity, StandardCharsets.UTF_8);
-    logger.log("entity: " + entityString);
+    log.debug("entity: " + entityString);
     
     HttpClient httpClient = HttpClientBuilder.create().build();
     HttpPost   request    = new HttpPost(urlString);
@@ -278,10 +443,10 @@ public class DynamicApproval implements RequestHandler<APIGatewayV2WebSocketEven
       // TODO Auto-generated catch block
       e.printStackTrace();
     }
-    logger.log("Status code: " + response.getStatusLine().getStatusCode());
+    log.debug("Status code: " + response.getStatusLine().getStatusCode());
     
     HttpEntity responseEntity = response.getEntity();
-    logger.log("responseEntity: " + responseEntity);
+    log.debug("responseEntity: " + responseEntity);
     String result = null;
     if (null != responseEntity) {
       try {
@@ -294,13 +459,13 @@ public class DynamicApproval implements RequestHandler<APIGatewayV2WebSocketEven
         e.printStackTrace();
       }
     }
-    logger.log("Result: " + result);
-    logger.log("Leaving sendCallBack");
+    log.debug("Result: " + result);
+    log.trace("Leaving sendCallBack");
   }
 
   
   private AmazonS3 getS3Client() {
-    logger.log("Entering getS3client");
+    log.trace("Entering getS3client");
     
     // AWSCredentials credentials = new BasicAWSCredentials ("access key", "secret key");
     // Client generation
@@ -308,9 +473,9 @@ public class DynamicApproval implements RequestHandler<APIGatewayV2WebSocketEven
       .withCredentials(DefaultAWSCredentialsProviderChain.getInstance())
       .withRegion (System.getenv("AWS_REGION"))
       .build ();
-    logger.log("Got s3 client.");
+    log.debug("Got s3 client.");
         
-    logger.log("Leaving getS3client");
+    log.trace("Leaving getS3client");
     return client;
   }
 }
